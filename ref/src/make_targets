@@ -10,7 +10,8 @@ UTIL_OBJS = \
 	mytimer.o
 
 MAIN_OBJ = \
-	main.o
+	main.o \
+    mpi_checkpoint.o
 
 MINIFE_INFO = 1
 MINIFE_KERNELS = 0

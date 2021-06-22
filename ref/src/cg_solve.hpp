@@ -35,6 +35,25 @@
 #include <mytimer.hpp>
 
 #include <outstream.hpp>
+#include <mpi_checkpoint.h>
+
+namespace {
+
+    template <class X>
+    void vector_write(MPI_File checkpoint, const X& x) {
+        MPI_Checkpoint_write_ordered(checkpoint, x.coefs.data(), x.coefs.size(), MPI_DOUBLE);
+        MPI_Checkpoint_write_ordered(checkpoint, &x.startIndex, 1, MPI_INT);
+        MPI_Checkpoint_write_ordered(checkpoint, &x.local_size, 1, MPI_INT);
+    }
+
+    template <class X>
+    void vector_read(MPI_File checkpoint, X& x) {
+        MPI_Checkpoint_read_ordered(checkpoint, x.coefs.data(), x.coefs.size(), MPI_DOUBLE);
+        MPI_Checkpoint_read_ordered(checkpoint, &x.startIndex, 1, MPI_INT);
+        MPI_Checkpoint_read_ordered(checkpoint, &x.local_size, 1, MPI_INT);
+    }
+
+}
 
 namespace miniFE {
 
@@ -118,8 +137,8 @@ cg_solve(OperatorType& A,
   if (print_freq>50) print_freq = 50;
   if (print_freq<1)  print_freq = 1;
 
-  ScalarType one = 1.0;
-  ScalarType zero = 0.0;
+  const ScalarType one = 1.0;
+  const ScalarType zero = 0.0;
 
   TICK(); waxpby(one, x, zero, x, p); TOCK(tWAXPY);
 
@@ -148,8 +167,37 @@ cg_solve(OperatorType& A,
   os << "brkdown_tol = " << brkdown_tol << std::endl;
 #endif
 
+  int k_min = 1;
+  MPI_File checkpoint = MPI_FILE_NULL;
+  int ret = MPI_Checkpoint_restore(MPI_COMM_WORLD, &checkpoint);
+  if (ret == MPI_SUCCESS) {
+      MPI_Checkpoint_read_ordered(checkpoint, &k_min, 1, MPI_INT);
+      vector_read(checkpoint, x);
+      vector_read(checkpoint, r);
+      vector_read(checkpoint, p);
+      vector_read(checkpoint, Ap);
+      MPI_Checkpoint_read_ordered(checkpoint, &oldrtrans, 1, MPI_DOUBLE);
+      MPI_Checkpoint_read_ordered(checkpoint, &rtrans, 1, MPI_DOUBLE);
+      MPI_Checkpoint_close(&checkpoint);
+  }
 
-  for(LocalOrdinalType k=1; k <= max_iter && normr > tolerance; ++k) {
+  for(LocalOrdinalType k=k_min; k <= max_iter && normr > tolerance; ++k) {
+
+      //if (k%print_freq == 0) {
+      if (k == max_iter/2) {
+          int ret = MPI_Checkpoint_create(MPI_COMM_WORLD, &checkpoint);
+          if (ret == MPI_SUCCESS) {
+              MPI_Checkpoint_write_ordered(checkpoint, &k, 1, MPI_INT);
+              vector_write(checkpoint, x);
+              vector_write(checkpoint, r);
+              vector_write(checkpoint, p);
+              vector_write(checkpoint, Ap);
+              MPI_Checkpoint_write_ordered(checkpoint, &oldrtrans, 1, MPI_DOUBLE);
+              MPI_Checkpoint_write_ordered(checkpoint, &rtrans, 1, MPI_DOUBLE);
+              MPI_Checkpoint_close(&checkpoint);
+          }
+      }
+
     if (k == 1) {
       TICK(); waxpby(one, r, zero, r, p); TOCK(tWAXPY);
     }
