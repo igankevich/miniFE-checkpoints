@@ -41,16 +41,23 @@ namespace {
 
     template <class X>
     void vector_write(MPI_File checkpoint, const X& x) {
+        if (x.local_size != x.coefs.size()) {
+            throw std::runtime_error("bad size");
+        }
+        //MPI_Checkpoint_write_ordered(checkpoint, &x.local_size, 1, MPI_INT);
+        //MPI_Checkpoint_write_ordered(checkpoint, &x.startIndex, 1, MPI_INT);
         MPI_Checkpoint_write_ordered(checkpoint, x.coefs.data(), x.coefs.size(), MPI_DOUBLE);
-        MPI_Checkpoint_write_ordered(checkpoint, &x.startIndex, 1, MPI_INT);
-        MPI_Checkpoint_write_ordered(checkpoint, &x.local_size, 1, MPI_INT);
     }
 
     template <class X>
     void vector_read(MPI_File checkpoint, X& x) {
+        static_assert(sizeof(x.startIndex) == sizeof(int));
+        static_assert(sizeof(x.local_size) == sizeof(int));
+        static_assert(sizeof(x.coefs[0]) == sizeof(double));
+        //MPI_Checkpoint_read_ordered(checkpoint, &x.local_size, 1, MPI_INT);
+        //MPI_Checkpoint_read_ordered(checkpoint, &x.startIndex, 1, MPI_INT);
+        //x.coefs.resize(x.local_size);
         MPI_Checkpoint_read_ordered(checkpoint, x.coefs.data(), x.coefs.size(), MPI_DOUBLE);
-        MPI_Checkpoint_read_ordered(checkpoint, &x.startIndex, 1, MPI_INT);
-        MPI_Checkpoint_read_ordered(checkpoint, &x.local_size, 1, MPI_INT);
     }
 
 }
@@ -172,28 +179,38 @@ cg_solve(OperatorType& A,
   int ret = MPI_Checkpoint_restore(MPI_COMM_WORLD, &checkpoint);
   if (ret == MPI_SUCCESS) {
       MPI_Checkpoint_read_ordered(checkpoint, &k_min, 1, MPI_INT);
+      MPI_Checkpoint_read_ordered(checkpoint, &oldrtrans, 1, MPI_DOUBLE);
+      MPI_Checkpoint_read_ordered(checkpoint, &rtrans, 1, MPI_DOUBLE);
+      MPI_Checkpoint_read_ordered(checkpoint, &normr, 1, MPI_DOUBLE);
       vector_read(checkpoint, x);
       vector_read(checkpoint, r);
       vector_read(checkpoint, p);
       vector_read(checkpoint, Ap);
-      MPI_Checkpoint_read_ordered(checkpoint, &oldrtrans, 1, MPI_DOUBLE);
-      MPI_Checkpoint_read_ordered(checkpoint, &rtrans, 1, MPI_DOUBLE);
       MPI_Checkpoint_close(&checkpoint);
+      if (myproc == 0) {
+          std::cout << "Restored" << std::endl;
+      }
   }
 
+  print_freq = 1;
   for(LocalOrdinalType k=k_min; k <= max_iter && normr > tolerance; ++k) {
 
       //if (k%print_freq == 0) {
-      if (k == max_iter/2) {
+      if (k == max_iter/2 && k_min == 1) {
           int ret = MPI_Checkpoint_create(MPI_COMM_WORLD, &checkpoint);
           if (ret == MPI_SUCCESS) {
+              static_assert(sizeof(k) == sizeof(int));
+              static_assert(sizeof(oldrtrans) == sizeof(double));
+              static_assert(sizeof(rtrans) == sizeof(double));
+              static_assert(sizeof(normr) == sizeof(double));
               MPI_Checkpoint_write_ordered(checkpoint, &k, 1, MPI_INT);
+              MPI_Checkpoint_write_ordered(checkpoint, &oldrtrans, 1, MPI_DOUBLE);
+              MPI_Checkpoint_write_ordered(checkpoint, &rtrans, 1, MPI_DOUBLE);
+              MPI_Checkpoint_write_ordered(checkpoint, &normr, 1, MPI_DOUBLE);
               vector_write(checkpoint, x);
               vector_write(checkpoint, r);
               vector_write(checkpoint, p);
               vector_write(checkpoint, Ap);
-              MPI_Checkpoint_write_ordered(checkpoint, &oldrtrans, 1, MPI_DOUBLE);
-              MPI_Checkpoint_write_ordered(checkpoint, &rtrans, 1, MPI_DOUBLE);
               MPI_Checkpoint_close(&checkpoint);
           }
       }

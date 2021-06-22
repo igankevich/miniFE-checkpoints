@@ -6,6 +6,12 @@ miniFE_info.hpp
 *.shfp.*
 *.checkpoint
 /output
+*.tmp
+slurm-*.out
+*dmtcp
+dmtcp*.sh
+*.lock
+/ref/src/hosts
 
 # Created by https://www.toptal.com/developers/gitignore/api/vim,linux
 # Edit at https://www.toptal.com/developers/gitignore?templates=vim,linux
