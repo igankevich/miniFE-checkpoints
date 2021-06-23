@@ -24,6 +24,8 @@ static const char* checkpoint_filename = 0;
 static mz_stream compressor = {0};
 static mz_stream decompressor = {0};
 static char* compression_buffer = 0;
+static double checkpoint_t0 = 0;
+static double checkpoint_t1 = 0;
 
 static void read_configuration_file(const char* filename) {
     FILE* file = fopen(filename, "r");
@@ -107,6 +109,7 @@ int MPI_Checkpoint_finalize() {
 }
 
 int MPI_Checkpoint_create(MPI_Comm comm, MPI_File* file) {
+    checkpoint_t0 = MPI_Wtime();
     if (!initialized) { MPI_Checkpoint_init(); }
     /* return if no checkpoint is requested */
     if (no_checkpoint) { return MPI_ERR_NO_CHECKPOINT; }
@@ -126,7 +129,13 @@ int MPI_Checkpoint_create(MPI_Comm comm, MPI_File* file) {
                 fprintf(stderr, "rank %d creating checkpoint using DMTCP\n", rank);
                 fflush(stderr);
             }
+            double t0 = MPI_Wtime();
             system("dmtcp_command --bccheckpoint");
+            double t1 = MPI_Wtime();
+            if (verbose) {
+                fprintf(stderr, "rank %d checkpoint took %f seconds\n", rank, t1-t0);
+                fflush(stderr);
+            }
         }
         MPI_Barrier(comm);
         return MPI_ERR_NO_CHECKPOINT;
@@ -157,6 +166,7 @@ int MPI_Checkpoint_create(MPI_Comm comm, MPI_File* file) {
 }
 
 int MPI_Checkpoint_restore(MPI_Comm comm, MPI_File* file) {
+    checkpoint_t0 = MPI_Wtime();
     if (!initialized) { MPI_Checkpoint_init(); }
     const char* filename = checkpoint_filename;
     if (filename == 0) { filename = ""; }
@@ -174,6 +184,13 @@ int MPI_Checkpoint_restore(MPI_Comm comm, MPI_File* file) {
 }
 
 int MPI_Checkpoint_close(MPI_File* file) {
+    checkpoint_t1 = MPI_Wtime();
+    if (verbose) {
+        int rank = 0;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        fprintf(stderr, "rank %d checkpoint create/restore took %f seconds\n", rank, checkpoint_t1-checkpoint_t0);
+        fflush(stderr);
+    }
     return MPI_File_close(file);
 }
 
