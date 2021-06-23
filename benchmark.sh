@@ -1,5 +1,13 @@
 #!/bin/sh
 
+mpi=openmpi
+hosts="-f"
+if test "$mpi" = "openmpi"
+then
+    #hosts="--prefix /gnu/store/ba2p8bpz3y701vnifafm7gf3gbprwvzl-openmpi-4.0.3 -machinefile"
+    hosts="-machinefile"
+fi
+
 profile() {
     time --format='%e' --append --output $output "$@"
 }
@@ -11,14 +19,19 @@ profile2() {
 set -e
 
 # update dependencies
-manifest=$(realpath manifest.scm)
-eval $(guix environment --manifest=$manifest --search-paths)
+if test -f manifest-$mpi.scm
+then
+    manifest=$(realpath manifest-$mpi.scm)
+else
+    manifest=$(realpath manifest.scm)
+fi
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 for i in $nodes
 do
     ssh $i "guix environment --manifest=$manifest --search-paths" &
 done
 wait
+eval $(guix environment --manifest=$manifest --search-paths)
 
 # build
 root=$(pwd)
@@ -33,12 +46,12 @@ EOF
 rm -f *.checkpoint *.yaml *.dmtcp dmtcp*sh
 
 # run
+how=no
 nx=300
 ny=300
 nz=300
 nprocs=$(expr $SLURM_JOB_NUM_NODES \* 16)
 args="-nx $nx -ny $ny -nz $nz"
-how=dmtcp
 output=$(mktemp)
 echo -n "$nx,$ny,$nz,$nprocs,," >> $output
 export HYDRA_IFACE=enp6s0
@@ -49,20 +62,20 @@ case "$how" in
         profile mpiexec -n $nprocs $PWD/miniFE.x $args
         ;;
     mpi)
-        profile mpiexec -n $nprocs $PWD/miniFE.x $args
+        profile mpiexec -n $nprocs $hosts $PWD/hosts $PWD/miniFE.x $args
         checkpoints=$(find . -name '*.checkpoint' | sort)
         for i in $checkpoints
         do
             export MPI_CHECKPOINT=$i
             echo -n "$nx,$ny,$nz,$nprocs,$(stat --format='%s' $i)," >> $output
-            profile mpiexec -n $nprocs $PWD/miniFE.x $args
+            profile mpiexec -n $nprocs $hosts $PWD/hosts $PWD/miniFE.x $args
         done
         ;;
     dmtcp)
         export MPI_CHECKPOINT=dmtcp
         pkill -f dmtcp || true
         dmtcp_coordinator --exit-on-last --daemon
-        profile dmtcp_launch --join-coordinator --coord-host $(hostname) mpiexec -n $nprocs -f $PWD/hosts $PWD/miniFE.x $args
+        profile dmtcp_launch --no-gzip --join-coordinator --coord-host $(hostname) mpiexec -n $nprocs $hosts $PWD/hosts $PWD/miniFE.x $args
         echo RESTORE
         pkill -f dmtcp || true
         sleep 1
@@ -78,7 +91,7 @@ case "$how" in
         rm ${output}2
         ;;
 esac
-output_dir=$root/output/miniFE/$how
+output_dir=$root/output/miniFE/$how/$mpi
 mkdir -p $output_dir
 column -t -s, $output
 mv -v $output $output_dir/$(date +%s).csv

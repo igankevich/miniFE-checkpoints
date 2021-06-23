@@ -174,7 +174,7 @@ cg_solve(OperatorType& A,
   os << "brkdown_tol = " << brkdown_tol << std::endl;
 #endif
 
-  int k_min = 1;
+  LocalOrdinalType k_min = 1;
   MPI_File checkpoint = MPI_FILE_NULL;
   int ret = MPI_Checkpoint_restore(MPI_COMM_WORLD, &checkpoint);
   if (ret == MPI_SUCCESS) {
@@ -187,15 +187,17 @@ cg_solve(OperatorType& A,
       vector_read(checkpoint, p);
       vector_read(checkpoint, Ap);
       MPI_Checkpoint_close(&checkpoint);
-      if (myproc == 0) {
-          std::cout << "Restored" << std::endl;
-      }
+      //MPI_Bcast(&k_min, 1, MPI_INT, 0, MPI_COMM_WORLD);
+      //MPI_Bcast(&oldrtrans, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+      //MPI_Bcast(&rtrans, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+      //MPI_Bcast(&normr, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+      fprintf(stderr, "rank %d restored k_min=%d\n", myproc, k_min);
+      fflush(stderr);
   }
 
   print_freq = 1;
   for(LocalOrdinalType k=k_min; k <= max_iter && normr > tolerance; ++k) {
 
-      //if (k%print_freq == 0) {
       if (k == max_iter/2 && k_min == 1) {
           int ret = MPI_Checkpoint_create(MPI_COMM_WORLD, &checkpoint);
           if (ret == MPI_SUCCESS) {

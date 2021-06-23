@@ -168,6 +168,8 @@ int MPI_Checkpoint_create(MPI_Comm comm, MPI_File* file) {
 int MPI_Checkpoint_restore(MPI_Comm comm, MPI_File* file) {
     checkpoint_t0 = MPI_Wtime();
     if (!initialized) { MPI_Checkpoint_init(); }
+    /* return if no checkpoint is requested */
+    if (no_checkpoint) { return MPI_ERR_NO_CHECKPOINT; }
     const char* filename = checkpoint_filename;
     if (filename == 0) { filename = ""; }
     /* do nothing if DMTCP checkpoints are used */
@@ -184,14 +186,16 @@ int MPI_Checkpoint_restore(MPI_Comm comm, MPI_File* file) {
 }
 
 int MPI_Checkpoint_close(MPI_File* file) {
+    int ret = MPI_File_close(file);
     checkpoint_t1 = MPI_Wtime();
     if (verbose) {
         int rank = 0;
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-        fprintf(stderr, "rank %d checkpoint create/restore took %f seconds\n", rank, checkpoint_t1-checkpoint_t0);
+        fprintf(stderr, "rank %d checkpoint create/restore took %f seconds\n",
+                rank, checkpoint_t1-checkpoint_t0);
         fflush(stderr);
     }
-    return MPI_File_close(file);
+    return ret;
 }
 
 int MPI_Checkpoint_write(MPI_File fh, const void *buf, int count,
