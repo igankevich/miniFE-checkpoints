@@ -11,6 +11,7 @@ MINIFE_MATRIX_TYPE = -DMINIFE_CSR_MATRIX
 #-----------------------------------------------------------------------
 
 CFLAGS = -O3 -march=native
+#CFLAGS = -O0 -g -fsanitize=address
 CXXFLAGS = $(CFLAGS)
 
 CPPFLAGS = -I. -I../utils -I../fem $(MINIFE_TYPES) $(MINIFE_MATRIX_TYPE) \

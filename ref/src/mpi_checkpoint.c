@@ -11,9 +11,25 @@
 #include <string.h>
 #include <time.h>
 
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+struct mpi_checkpoint {
+    int fd;
+    void* data;
+    size_t size;
+    size_t offset;
+    /* the number of bytes that are "freed" (MADV_DONTNEED)*/
+    size_t start;
+};
+
 static char checkpoint_prefix[4096] = "checkpoint";
 /* minimum checkpoint interval in seconds */
 static int checkpoint_min_interval = 0;
+const size_t checkpoint_initial_size = 4096;
 static int last_checkpoint_timestamp = 0;
 static int initialized = 0;
 static int verbose = 0;
@@ -26,6 +42,41 @@ static mz_stream decompressor = {0};
 static char* compression_buffer = 0;
 static double checkpoint_t0 = 0;
 static double checkpoint_t1 = 0;
+/* fortran checkpoints */
+static struct mpi_checkpoint checkpoints[4096/sizeof(struct mpi_checkpoint)];
+
+static struct mpi_checkpoint* checkpoint_alloc() {
+    struct mpi_checkpoint* checkpoint = malloc(sizeof(struct mpi_checkpoint));
+    if (!checkpoint) {
+        fprintf(stderr, "not enough memory\n");
+        exit(EXIT_FAILURE);
+    }
+    memset(checkpoint, 0, sizeof(struct mpi_checkpoint));
+    return checkpoint;
+}
+
+static void checkpoint_free(struct mpi_checkpoint* checkpoint) {
+    if (checkpoint->data) {
+        if (msync(checkpoint->data, checkpoint->size, MS_SYNC) == -1) {
+            perror("msync");
+            exit(EXIT_FAILURE);
+        }
+        if (munmap(checkpoint->data, checkpoint->size) == -1) {
+            perror("munmap");
+            exit(EXIT_FAILURE);
+        }
+        checkpoint->data = 0;
+        checkpoint->size = 0;
+    }
+    if (checkpoint->fd != -1) {
+        if (close(checkpoint->fd) == -1) {
+            perror("close");
+            exit(EXIT_FAILURE);
+        }
+        checkpoint->fd = -1;
+    }
+    free(checkpoint);
+}
 
 static void read_configuration_file(const char* filename) {
     FILE* file = fopen(filename, "r");
@@ -86,6 +137,24 @@ static void read_configuration_file(const char* filename) {
     if (fclose(file) == -1) { perror("fclose"); exit(EXIT_FAILURE); }
 }
 
+/* The path must end with "/". */
+static int mkdir_p(char* path, mode_t mode) {
+    char* first = path, last = 0;
+    while (*path) {
+        if (*path == '/') {
+            *path = 0;
+            if (mkdir(first, mode) == -1 && errno != EEXIST) {
+                *path = '/';
+                return -1;
+            }
+            *path = '/';
+            first = path+1;
+        }
+        ++path;
+    }
+    return 0;
+}
+
 int MPI_Checkpoint_init() {
     strcpy(checkpoint_prefix, program_invocation_short_name);
     const char* config = getenv("MPI_CHECKPOINT_CONFIG");
@@ -108,7 +177,7 @@ int MPI_Checkpoint_finalize() {
     return ret == 0 ? MPI_SUCCESS : MPI_ERR_OTHER;
 }
 
-int MPI_Checkpoint_create(MPI_Comm comm, MPI_File* file) {
+int MPI_Checkpoint_create(MPI_Comm comm, MPI_Checkpoint* file) {
     checkpoint_t0 = MPI_Wtime();
     if (!initialized) { MPI_Checkpoint_init(); }
     /* return if no checkpoint is requested */
@@ -141,52 +210,100 @@ int MPI_Checkpoint_create(MPI_Comm comm, MPI_File* file) {
         return MPI_ERR_NO_CHECKPOINT;
     }
     /* create checkpoint manually */
-    char newfilename[4096] = {0};
-    if (rank == 0) {
-        size_t n = strlen(checkpoint_prefix);
-        strncpy(newfilename, checkpoint_prefix, n);
-        time_t now = time(0);
-        struct tm t = {0};
-        /* N.B. some MPI implementations disallow colon symbol in file names.
-           Here we use underscore instead. */
-        strftime(newfilename+n, sizeof(newfilename)-n,
-                 "_%Y-%m-%dT%H_%M_%S%z.checkpoint", localtime_r(&now, &t));
-        newfilename[sizeof(newfilename)-1] = 0;
+    char newfilename[4096];
+    /* synchronize time */
+    time_t now = time(0);
+    MPI_Bcast(&now, sizeof(now), MPI_BYTE, 0, comm);
+    if (snprintf(newfilename, sizeof(newfilename), "%s.%lu.checkpoint/",
+                 checkpoint_prefix, now) < 0) {
+        perror("snprintf");
+        exit(EXIT_FAILURE);
     }
-    MPI_Bcast(newfilename, sizeof(newfilename), MPI_CHAR, 0, comm);
-    int ret = MPI_File_open(comm, newfilename, MPI_MODE_CREATE|MPI_MODE_WRONLY,
-                            MPI_INFO_NULL, file);
-    if (ret == MPI_SUCCESS) {
-        if (verbose) {
-            fprintf(stderr, "rank %d creating %s\n", rank, newfilename);
-            fflush(stderr);
-        }
+    if (mkdir_p(newfilename, 0755) == -1) {
+        perror("mkdir");
+        exit(EXIT_FAILURE);
     }
-    return ret;
+    if (snprintf(newfilename, sizeof(newfilename), "%s.%lu.checkpoint/%d",
+                 checkpoint_prefix, now, rank) < 0) {
+        perror("snprintf");
+        exit(EXIT_FAILURE);
+    }
+    MPI_Checkpoint checkpoint = checkpoint_alloc();
+    checkpoint->fd = open(newfilename, O_CREAT|O_RDWR|O_CLOEXEC, 0644);
+    if (checkpoint->fd == -1) {
+        fprintf(stderr, "Unable to open checkpoint \"%s\": %s\n",
+                newfilename, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    checkpoint->size = checkpoint_initial_size;
+    if (ftruncate(checkpoint->fd, checkpoint->size) == -1) {
+        perror("ftruncate");
+        exit(EXIT_FAILURE);
+    }
+    checkpoint->data = mmap(0, checkpoint->size, PROT_WRITE, MAP_SHARED, checkpoint->fd, 0);
+    if (checkpoint->data == MAP_FAILED) {
+        perror("mmap");
+        exit(EXIT_FAILURE);
+    }
+    *file = checkpoint;
+    if (verbose) {
+        fprintf(stderr, "rank %d creating %s\n", rank, newfilename);
+        fflush(stderr);
+    }
+    return MPI_SUCCESS;
 }
 
-int MPI_Checkpoint_restore(MPI_Comm comm, MPI_File* file) {
+int MPI_Checkpoint_restore(MPI_Comm comm, MPI_Checkpoint* file) {
     checkpoint_t0 = MPI_Wtime();
     if (!initialized) { MPI_Checkpoint_init(); }
     /* return if no checkpoint is requested */
     if (no_checkpoint) { return MPI_ERR_NO_CHECKPOINT; }
     const char* filename = checkpoint_filename;
-    if (filename == 0) { filename = ""; }
+    if (filename == 0) { return MPI_ERR_NO_CHECKPOINT; }
+    if (strcmp(filename, "") == 0) { return MPI_ERR_NO_CHECKPOINT; }
     /* do nothing if DMTCP checkpoints are used */
     if (strcmp(filename, "dmtcp") == 0) { return MPI_ERR_NO_CHECKPOINT; }
     /* restore manually */
-    int ret = MPI_File_open(comm, filename, MPI_MODE_RDONLY, MPI_INFO_NULL, file);
-    if (ret == MPI_SUCCESS && verbose) {
-        int rank = 0;
-        MPI_Comm_rank(comm, &rank);
-        fprintf(stderr, "rank %d restored from %s\n", rank, filename);
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
+    char newfilename[4096];
+    if (snprintf(newfilename, sizeof(newfilename), "%s/%d", filename, rank) < 0) {
+        perror("snprintf");
+        exit(EXIT_FAILURE);
+    }
+    int checkpoint_fd = open(newfilename, O_RDONLY|O_CLOEXEC);
+    if (checkpoint_fd == -1) {
+        fprintf(stderr, "Unable to open checkpoint \"%s\": %s\n",
+                newfilename, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    MPI_Checkpoint checkpoint = checkpoint_alloc();
+    checkpoint->fd = checkpoint_fd;
+    struct stat status;
+    if (fstat(checkpoint->fd, &status) == -1) {
+        perror("fstat");
+        exit(EXIT_FAILURE);
+    }
+    checkpoint->size = status.st_size;
+    checkpoint->data = mmap(0, checkpoint->size, PROT_READ, MAP_PRIVATE, checkpoint->fd, 0);
+    if (checkpoint->data == MAP_FAILED) {
+        perror("mmap");
+        exit(EXIT_FAILURE);
+    }
+    if (madvise(checkpoint->data, checkpoint->size, MADV_SEQUENTIAL) == -1) {
+        perror("madvise");
+        exit(EXIT_FAILURE);
+    }
+    if (verbose) {
+        fprintf(stderr, "rank %d restored from %s\n", rank, newfilename);
         fflush(stderr);
     }
-    return ret;
+    *file = checkpoint;
+    return MPI_SUCCESS;
 }
 
-int MPI_Checkpoint_close(MPI_File* file) {
-    int ret = MPI_File_close(file);
+int MPI_Checkpoint_close(MPI_Checkpoint* file) {
+    checkpoint_free(*file);
     checkpoint_t1 = MPI_Wtime();
     if (verbose) {
         int rank = 0;
@@ -195,15 +312,45 @@ int MPI_Checkpoint_close(MPI_File* file) {
                 rank, checkpoint_t1-checkpoint_t0);
         fflush(stderr);
     }
-    return ret;
+    return MPI_SUCCESS;
 }
 
-int MPI_Checkpoint_write(MPI_File fh, const void *buf, int count,
-                         MPI_Datatype datatype) {
-    return MPI_File_write(fh,buf,count,datatype,MPI_STATUS_IGNORE);
+int MPI_Checkpoint_write(MPI_Checkpoint checkpoint, const void *buf, int count, MPI_Datatype datatype) {
+    int element_size = 0;
+    MPI_Type_size(datatype, &element_size);
+    int size_in_bytes = count*element_size;
+    size_t old_size = 0;
+    while (checkpoint->size - checkpoint->offset < size_in_bytes) {
+        size_t new_size = checkpoint->size == 0
+            ? checkpoint_initial_size : (checkpoint->size * 2);
+        if (ftruncate(checkpoint->fd, new_size) == -1) {
+            perror("ftruncate");
+            exit(EXIT_FAILURE);
+        }
+        void* new_data = mremap(checkpoint->data, checkpoint->size, new_size, MREMAP_MAYMOVE);
+        if (!new_data) {
+            perror("mremap");
+            exit(EXIT_FAILURE);
+        }
+        old_size = checkpoint->size;
+        checkpoint->data = new_data;
+        checkpoint->size = new_size;
+    }
+    if (old_size != 0) {
+        if (madvise(((char*)checkpoint->data) + checkpoint->start,
+                    old_size-checkpoint->start, MADV_DONTNEED) == -1) {
+            perror("madvise");
+            exit(EXIT_FAILURE);
+        }
+        checkpoint->start = old_size;
+    }
+    memcpy(((char*)checkpoint->data) + checkpoint->offset, buf, size_in_bytes);
+    checkpoint->offset += size_in_bytes;
+    return MPI_SUCCESS;
 }
 
-int MPI_Checkpoint_write_ordered(MPI_File fh, const void *buf, int count,
+/*
+int MPI_Checkpoint_write_ordered(MPI_Checkpoint fh, const void *buf, int count,
                                  MPI_Datatype datatype) {
     if (compression_level != 0) {
         int element_size = 0;
@@ -222,23 +369,28 @@ int MPI_Checkpoint_write_ordered(MPI_File fh, const void *buf, int count,
         if (mz_deflate(&compressor, MZ_FINISH) != MZ_STREAM_END) {
             return MPI_ERR_OTHER;
         }
-        /*
-        fprintf(stderr, "total in = %d, total out = %d, array size %d, count %d\n",
-                compressor.total_in, compressor.total_out, size_in_bytes, count);
-                */
         int n = compressor.total_out;
         int ret = MPI_File_write_ordered(fh,&n,1,MPI_INT,MPI_STATUS_IGNORE);
         return MPI_File_write_ordered(fh,compression_buffer,n,MPI_BYTE,MPI_STATUS_IGNORE);
     }
     return MPI_File_write_ordered(fh,buf,count,datatype,MPI_STATUS_IGNORE);
 }
+*/
 
-int MPI_Checkpoint_read(MPI_File fh, void *buf, int count,
-                        MPI_Datatype datatype) {
-    return MPI_File_read(fh,buf,count,datatype,MPI_STATUS_IGNORE);
+int MPI_Checkpoint_read(MPI_Checkpoint checkpoint, void *buf, int count, MPI_Datatype datatype) {
+    int element_size = 0;
+    MPI_Type_size(datatype, &element_size);
+    int size_in_bytes = count*element_size;
+    if (checkpoint->offset + size_in_bytes > checkpoint->size) {
+        return MPI_ERR_OTHER;
+    }
+    memcpy(buf, ((char*)checkpoint->data) + checkpoint->offset, size_in_bytes);
+    checkpoint->offset += size_in_bytes;
+    return MPI_SUCCESS;
 }
 
-int MPI_Checkpoint_read_ordered(MPI_File fh, void *buf, int count, MPI_Datatype datatype) {
+/*
+int MPI_Checkpoint_read_ordered(MPI_Checkpoint fh, void *buf, int count, MPI_Datatype datatype) {
     if (compression_level != 0) {
         int buffer_size = 0;
         int element_size = 0;
@@ -257,30 +409,28 @@ int MPI_Checkpoint_read_ordered(MPI_File fh, void *buf, int count, MPI_Datatype 
         decompressor.next_out = buf;
         decompressor.avail_out = size_in_bytes;
         if (mz_inflate(&decompressor, MZ_FINISH) != MZ_STREAM_END) { return MPI_ERR_OTHER; }
-        /*
-        fprintf(stderr, "decompressor total in = %d, total out = %d\n",
-                decompressor.total_in, decompressor.total_out);
-        */
         return ret;
     }
     return MPI_File_read_ordered(fh,buf,count,datatype,MPI_STATUS_IGNORE);
 }
+*/
 
 /* Fortran bindings */
 
+/*
 void mpi_checkpoint_create_(MPI_Fint* comm, MPI_Fint* file, MPI_Fint* error) {
-    MPI_File c_file = MPI_File_f2c(*file);
+    MPI_Checkpoint c_file = MPI_File_f2c(*file);
     *error = MPI_Checkpoint_create(MPI_Comm_f2c(*comm), &c_file);
     *file = MPI_File_c2f(c_file);
 }
 
 void mpi_checkpoint_restore_(MPI_Fint* comm, MPI_Fint* file, MPI_Fint* error) {
-    MPI_File c_file = MPI_File_f2c(*file);
+    MPI_Checkpoint c_file = MPI_File_f2c(*file);
     *error = MPI_Checkpoint_restore(MPI_Comm_f2c(*comm), &c_file);
 }
 
 void mpi_checkpoint_close_(MPI_Fint* file, MPI_Fint* error) {
-    MPI_File c_file = MPI_File_f2c(*file);
+    MPI_Checkpoint c_file = MPI_File_f2c(*file);
     *error = MPI_File_close(&c_file);
     *file = MPI_File_c2f(c_file);
 }
@@ -316,3 +466,4 @@ void mpi_checkpoint_read_ordered_(MPI_Fint* fh, char* buf, MPI_Fint* count,
     *error = MPI_Checkpoint_read_ordered(MPI_File_f2c(*fh), buf, *count,
                                          MPI_Type_f2c(*datatype));
 }
+*/

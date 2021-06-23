@@ -33,6 +33,7 @@
 
 #ifdef HAVE_MPI
 #include <mpi.h>
+#include <mpi_checkpoint.h>
 #endif
 
 #ifdef MINIFE_HAVE_TPI
@@ -118,6 +119,7 @@ void initialize_mpi(int argc, char** argv, int& numprocs, int& myproc)
   MPI_Init(&argc, &argv);
   MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
   MPI_Comm_rank(MPI_COMM_WORLD, &myproc);
+  MPI_Checkpoint_init();
 #else
   numprocs = 1;
   myproc = 0;
@@ -128,6 +130,7 @@ void initialize_mpi(int argc, char** argv, int& numprocs, int& myproc)
 void finalize_mpi()
 {
 #ifdef HAVE_MPI
+  MPI_Checkpoint_finalize();
   MPI_Finalize();
 #endif
 }
