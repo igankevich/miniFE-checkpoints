@@ -17,6 +17,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+enum checkpoint_flags { CHECKPOINT_READ_ONLY = 1, CHECKPOINT_WRITE_ONLY = 2 };
+
 struct mpi_checkpoint {
     int fd;
     void* data;
@@ -24,6 +26,7 @@ struct mpi_checkpoint {
     size_t offset;
     /* the number of bytes that are "freed" (MADV_DONTNEED)*/
     size_t start;
+    enum checkpoint_flags flags;
 };
 
 static char checkpoint_prefix[4096] = "checkpoint";
@@ -44,6 +47,7 @@ static double checkpoint_t0 = 0;
 static double checkpoint_t1 = 0;
 /* fortran checkpoints */
 static struct mpi_checkpoint checkpoints[4096/sizeof(struct mpi_checkpoint)];
+static size_t page_size = 4096;
 
 static struct mpi_checkpoint* checkpoint_alloc() {
     struct mpi_checkpoint* checkpoint = malloc(sizeof(struct mpi_checkpoint));
@@ -57,9 +61,11 @@ static struct mpi_checkpoint* checkpoint_alloc() {
 
 static void checkpoint_free(struct mpi_checkpoint* checkpoint) {
     if (checkpoint->data) {
-        if (msync(checkpoint->data, checkpoint->size, MS_SYNC) == -1) {
-            perror("msync");
-            exit(EXIT_FAILURE);
+        if (checkpoint->flags & CHECKPOINT_WRITE_ONLY) {
+            if (msync(checkpoint->data, checkpoint->size, MS_SYNC) == -1) {
+                perror("msync");
+                exit(EXIT_FAILURE);
+            }
         }
         if (munmap(checkpoint->data, checkpoint->size) == -1) {
             perror("munmap");
@@ -69,6 +75,13 @@ static void checkpoint_free(struct mpi_checkpoint* checkpoint) {
         checkpoint->size = 0;
     }
     if (checkpoint->fd != -1) {
+        if (checkpoint->flags & CHECKPOINT_WRITE_ONLY) {
+            if (ftruncate(checkpoint->fd, checkpoint->offset) == -1) {
+                perror("ftruncate");
+                exit(EXIT_FAILURE);
+            }
+        }
+        checkpoint->offset = 0;
         if (close(checkpoint->fd) == -1) {
             perror("close");
             exit(EXIT_FAILURE);
@@ -168,6 +181,8 @@ int MPI_Checkpoint_init() {
     int ret = mz_deflateInit(&compressor, compression_level);
     ret |= mz_inflateInit(&decompressor);
     initialized = 1;
+    page_size = sysconf(_SC_PAGE_SIZE);
+    if (page_size <= 0) { page_size = 4096UL; }
     return ret == 0 ? MPI_SUCCESS : MPI_ERR_OTHER;
 }
 
@@ -235,6 +250,7 @@ int MPI_Checkpoint_create(MPI_Comm comm, MPI_Checkpoint* file) {
                 newfilename, strerror(errno));
         exit(EXIT_FAILURE);
     }
+    checkpoint->flags = CHECKPOINT_WRITE_ONLY;
     checkpoint->size = checkpoint_initial_size;
     if (ftruncate(checkpoint->fd, checkpoint->size) == -1) {
         perror("ftruncate");
@@ -279,6 +295,7 @@ int MPI_Checkpoint_restore(MPI_Comm comm, MPI_Checkpoint* file) {
     }
     MPI_Checkpoint checkpoint = checkpoint_alloc();
     checkpoint->fd = checkpoint_fd;
+    checkpoint->flags = CHECKPOINT_READ_ONLY;
     struct stat status;
     if (fstat(checkpoint->fd, &status) == -1) {
         perror("fstat");
@@ -321,8 +338,9 @@ int MPI_Checkpoint_write(MPI_Checkpoint checkpoint, const void *buf, int count, 
     int size_in_bytes = count*element_size;
     size_t old_size = 0;
     while (checkpoint->size - checkpoint->offset < size_in_bytes) {
-        size_t new_size = checkpoint->size == 0
-            ? checkpoint_initial_size : (checkpoint->size * 2);
+        size_t new_size = checkpoint->offset + size_in_bytes;
+        size_t remainder = new_size%page_size;
+        if (remainder != 0) { new_size += page_size-remainder; }
         if (ftruncate(checkpoint->fd, new_size) == -1) {
             perror("ftruncate");
             exit(EXIT_FAILURE);
@@ -336,6 +354,7 @@ int MPI_Checkpoint_write(MPI_Checkpoint checkpoint, const void *buf, int count, 
         checkpoint->data = new_data;
         checkpoint->size = new_size;
     }
+    memcpy(((char*)checkpoint->data) + checkpoint->offset, buf, size_in_bytes);
     if (old_size != 0) {
         if (madvise(((char*)checkpoint->data) + checkpoint->start,
                     old_size-checkpoint->start, MADV_DONTNEED) == -1) {
@@ -344,7 +363,6 @@ int MPI_Checkpoint_write(MPI_Checkpoint checkpoint, const void *buf, int count, 
         }
         checkpoint->start = old_size;
     }
-    memcpy(((char*)checkpoint->data) + checkpoint->offset, buf, size_in_bytes);
     checkpoint->offset += size_in_bytes;
     return MPI_SUCCESS;
 }

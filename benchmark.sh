@@ -1,6 +1,6 @@
 #!/bin/sh
 
-mpi=openmpi
+mpi=mpich
 hosts="-f"
 if test "$mpi" = "openmpi"
 then
@@ -43,7 +43,7 @@ cat > $MPI_CHECKPOINT_CONFIG << EOF
 checkpoint-interval = 0
 verbose = 1
 EOF
-rm -f *.checkpoint *.yaml *.dmtcp dmtcp*sh
+rm -rf --one-file-system *.checkpoint *.yaml *.dmtcp dmtcp*sh
 
 # run
 how=no
@@ -55,11 +55,12 @@ args="-nx $nx -ny $ny -nz $nz"
 output=$(mktemp)
 echo -n "$nx,$ny,$nz,$nprocs,," >> $output
 export HYDRA_IFACE=enp6s0
+export HYDRA_RMK=user
 export UCX_NET_DEVICES=enp6s0
 case "$how" in
     no)
         export MPI_NO_CHECKPOINT=1
-        profile mpiexec -n $nprocs $PWD/miniFE.x $args
+        profile mpiexec -n $nprocs $hosts $PWD/hosts $PWD/miniFE.x $args
         ;;
     mpi)
         profile mpiexec -n $nprocs $hosts $PWD/hosts $PWD/miniFE.x $args
@@ -67,7 +68,7 @@ case "$how" in
         for i in $checkpoints
         do
             export MPI_CHECKPOINT=$i
-            echo -n "$nx,$ny,$nz,$nprocs,$(stat --format='%s' $i)," >> $output
+            echo -n "$nx,$ny,$nz,$nprocs,$(stat --format='%s' $i/* | awk '{s+=$1} END {print s}')," >> $output
             profile mpiexec -n $nprocs $hosts $PWD/hosts $PWD/miniFE.x $args
         done
         ;;
@@ -75,7 +76,7 @@ case "$how" in
         export MPI_CHECKPOINT=dmtcp
         pkill -f dmtcp || true
         dmtcp_coordinator --exit-on-last --daemon
-        profile dmtcp_launch --no-gzip --join-coordinator --coord-host $(hostname) mpiexec -n $nprocs $hosts $PWD/hosts $PWD/miniFE.x $args
+        profile dmtcp_launch --join-coordinator --coord-host $(hostname) mpiexec -n $nprocs $hosts $PWD/hosts $PWD/miniFE.x $args
         echo RESTORE
         pkill -f dmtcp || true
         sleep 1
