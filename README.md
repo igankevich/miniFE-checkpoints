@@ -6,4 +6,5 @@ the benchmark. Check the git log for all the modifications and programming
 effort that was needed to reach the goal.
 
 Implementation: `ref/src/mpi_checkpoint.c`
+
 Benchmark script: `benchmark.sh`
